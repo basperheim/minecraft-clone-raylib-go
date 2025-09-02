@@ -1,232 +1,258 @@
-You were right — my previous answer wandered into a lot of options. Here's the short, blunt answer you actually asked for:
+# mini3d — tiny C engine + Python controller (example)
 
-If your goal is: "most cross-platform, easiest to compile on many arches, fastest way to a working _walk/jump around a cube_ prototype" — use plain [C raylib](https://www.raylib.com/).
+Minimal, practical example showing how to run a small raylib-based C engine as a shared library and drive it from Python via `ctypes`.
+This repo is a _reference/demo_, not a full game engine — but it contains a usable Minecraft-like prototype (dense voxels, colored cubes, basic first-person controls) and the exact pieces you need to extend it.
 
-Why (brief, opinionated):
-
-- Raylib is tiny, stable, and battle-tested. It's written in C, easy to build on Linux/macOS/Windows, and hides GL/glfw details so you can ship a 3D prototype in a single source file.
-- You don't need to sweat GL loaders, shaders, or platform window plumbing for a simple prototype.
-- When you later need language bindings / engine wiring, you can still expose a C ABI from your engine with the same approach. Raylib's simplicity shortens the feedback loop and avoids build hell while you learn.
-
-Below I give you:
-
-1. A single-file **C example** (raylib) you can paste into `hello_cube.c` that gives a first-person controller with mouse look, WASD movement, sprint, gravity + jump, and a textured cube at the origin.
-2. Exact compile/run commands for Linux (apt), macOS (brew), and Windows (MSYS2).
-3. A short note on how to evolve from here (if you want to go C++/GLFW later).
+> TL;DR: build `libmini3d` (C/raylib), put `terrain_sheet_simple.png` next to the Python script, run `python3 test_client.py`. C renders & handles input/physics; Python decides what blocks exist and calls the C API.
 
 ---
 
-## 1) Single-file raylib "Hello Cube" (copy → `hello_cube.c`)
+## What this example does
 
-```c
-// hello_cube.c
-// Build: see commands below
-#include "raylib.h"
-#include <math.h>
+- C engine (`engine.c`)
 
-int main(void) {
-    const int screenW = 1280;
-    const int screenH = 720;
-    InitWindow(screenW, screenH, "Hello Cube - Raylib FPS (walk & jump)");
-    SetTargetFPS(60);
+  - Opens window, input sampling, camera, basic physics (gravity + jump).
+  - Stores a small voxel world (dense array).
+  - Renders the world (naive draw-every-block approach — good for small demos).
+  - Loads a sprite/terrain atlas and slices it into tiles (optional).
+  - Exposes a small C API for creation/destruction, world edits, atlas loading and ticking frames.
 
-    // Camera (we'll control position + yaw/pitch)
-    Camera3D camera = { 0 };
-    camera.position = (Vector3){ 0.0f, 2.0f, 4.0f }; // eye pos
-    camera.target   = (Vector3){ 0.0f, 1.6f, 0.0f }; // look-at
-    camera.up       = (Vector3){ 0.0f, 1.0f, 0.0f };
-    camera.fovy     = 60.0f;
-    camera.projection = CAMERA_PERSPECTIVE;
+- Python client (`test_client.py`)
 
-    // Controls / physics
-    float yaw = 3.14159f;                 // facing -Z initially
-    float pitch = -0.15f;
-    float mouseSens = 0.0025f;
-    float speed = 6.0f;
-    float sprintMult = 1.8f;
-    float eyeHeight = 1.7f;
+  - Loads the engine shared library via `ctypes`.
+  - Loads/creates a sprite sheet (optional script included).
+  - Calls API functions to create the world, place blocks, and loop the engine by calling `engine_tick()` each frame.
 
-    float velY = 0.0f;
-    const float gravity = -18.0f;
-    const float jumpSpeed = 6.5f;
-
-    // Hide cursor and capture mouse for mouselook
-    bool cursorLocked = true;
-    DisableCursor();
-
-    // Simple world ground (y = 0)
-    const float groundY = 0.0f;
-
-    // Cube at origin for reference
-    Vector3 cubePos = { 0.0f, 0.5f, 0.0f };
-
-    while (!WindowShouldClose()) {
-        float dt = GetFrameTime();
-
-        // Toggle cursor lock
-        if (IsKeyPressed(KEY_TAB)) {
-            cursorLocked = !cursorLocked;
-            if (cursorLocked) DisableCursor(); else EnableCursor();
-        }
-
-        // Mouse look
-        if (cursorLocked) {
-            Vector2 d = GetMouseDelta();
-            yaw   -= d.x * mouseSens;
-            pitch -= d.y * mouseSens;
-            const float limit = PI/2.2f;
-            if (pitch > limit) pitch = limit;
-            if (pitch < -limit) pitch = -limit;
-        }
-
-        // Build forward/right vectors from yaw/pitch (standard FPS math)
-        float cp = cosf(pitch);
-        float sp = sinf(pitch);
-        float sy = sinf(yaw);
-        float cy = cosf(yaw);
-
-        Vector3 forward = { cp*sy, sp, -cp*cy }; // note: z negative forward
-        // flatten for ground movement
-        Vector3 forwardGround = { forward.x, 0.0f, forward.z };
-        float fglen = Vector3Length(forwardGround);
-        if (fglen > 0.0001f) forwardGround = Vector3Scale(forwardGround, 1.0f/fglen);
-
-        Vector3 right = Vector3Normalize(Vector3CrossProduct(forward, camera.up));
-
-        // Movement input
-        Vector3 move = { 0, 0, 0 };
-        if (IsKeyDown(KEY_W)) move = Vector3Add(move, forwardGround);
-        if (IsKeyDown(KEY_S)) move = Vector3Subtract(move, forwardGround);
-        if (IsKeyDown(KEY_A)) move = Vector3Subtract(move, right);
-        if (IsKeyDown(KEY_D)) move = Vector3Add(move, right);
-
-        // normalize move
-        float mlen = Vector3Length(move);
-        if (mlen > 0.0001f) move = Vector3Scale(move, 1.0f / mlen);
-
-        float curSpeed = speed;
-        if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) curSpeed *= sprintMult;
-
-        // Apply horizontal movement
-        camera.position = Vector3Add(camera.position, Vector3Scale(move, curSpeed * dt));
-
-        // Gravity + ground collision
-        velY += gravity * dt;
-        camera.position.y += velY * dt;
-
-        float minY = groundY + eyeHeight;
-        bool onGround = false;
-        if (camera.position.y <= minY) {
-            camera.position.y = minY;
-            velY = 0;
-            onGround = true;
-        }
-
-        // Jump
-        if (onGround && IsKeyPressed(KEY_SPACE)) {
-            velY = jumpSpeed;
-            onGround = false;
-        }
-
-        // Update camera target from yaw/pitch (look at camera.position + forward)
-        camera.target = Vector3Add(camera.position, forward);
-
-        // --- drawing ---
-        BeginDrawing();
-        ClearBackground(RAYWHITE);
-
-        BeginMode3D(camera);
-
-        // ground grid
-        DrawGrid(16, 1.0f);
-
-        // reference cube
-        DrawCube(cubePos, 1.0f, 1.0f, 1.0f, MAROON);
-        DrawCubeWires(cubePos, 1.0f, 1.0f, 1.0f, BLACK);
-
-        EndMode3D();
-
-        DrawText("WASD to move, SPACE jump, SHIFT sprint, TAB toggle cursor", 10, 10, 14, DARKGRAY);
-        DrawFPS(10, 30);
-
-        EndDrawing();
-    }
-
-    CloseWindow();
-    return 0;
-}
-```
-
-Notes about the example:
-
-- No external shaders, no textures required — it draws a cube, a grid, and provides a first-person style controller (mouse look + physics).
-- The math is tiny and explicit so you can read it and tweak it.
-- Raylib calls used are stable across versions and platforms.
+Why this split? Keep frame-critical code in C for performance; keep game logic / rules / iteration speed in Python.
 
 ---
 
-## 2) How to compile & run (quick platform commands)
+## Prerequisites
 
-### Linux (Ubuntu / Debian)
+### Tools & libs
 
-```bash
-# Install raylib (apt may not have latest; build from package or use distribution packages)
-# Simpler: install via package manager if available, or build from source. On Ubuntu:
-sudo apt update
-sudo apt install libraylib-dev build-essential
+- C compiler
 
-# Compile
-gcc hello_cube.c -o hello_cube -lraylib -lm -lpthread -ldl -lrt -lGL
+  - macOS: `cc` (clang), Homebrew toolchain recommended
+  - Linux: `gcc`/`clang`
+  - Windows: MSYS2 MinGW-w64 (`pacman` packages)
 
-# Run
-./hello_cube
-```
+- raylib (C library) installed for your platform
 
-If apt doesn't have `libraylib-dev`, use `brew` on Linux or build raylib from source per its README.
+  - macOS: `brew install raylib pkg-config`
+  - Ubuntu: `sudo apt install libraylib-dev pkg-config` (or build raylib from source)
+  - Windows (MSYS2): `pacman -S mingw-w64-x86_64-raylib pkg-config`
+
+- Python 3
+
+  - No special binding packages required — we use the stdlib `ctypes`.
+  - Optional: `pip install pillow` if you want to generate the sprite-sheet PNG from the included generator.
+
+- `pkg-config` recommended (easier compile lines)
+
+---
+
+## Files of interest
+
+- `engine.h` — public C API header (what Python calls)
+- `engine.c` — engine implementation (raylib + logic + rendering)
+- `test_client.py` — Python example client using `ctypes`
+- `make_terrain_sheet.py` — Pillow script to create `terrain_sheet_simple.png` and JSON index
+- `terrain_sheet_simple.png` (generated or provided) — atlas used by the example
+- `README.md` — this file
+
+---
+
+## Build (shared library)
+
+> Build commands assume repo root contains `engine.c` and `engine.h`. Replace paths/names as needed.
 
 ### macOS (Homebrew)
 
 ```bash
-brew install raylib
-cc hello_cube.c -o hello_cube -lraylib -framework Cocoa -framework OpenGL -framework IOKit
-./hello_cube
+# ensure raylib installed: brew install raylib pkg-config
+RP=$(brew --prefix raylib)        # e.g. /opt/homebrew/opt/raylib
+export PKG_CONFIG_PATH="$RP/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+# Quick with pkg-config (preferred if it finds raylib)
+cc -dynamiclib -o libmini3d.dylib engine.c $(pkg-config --cflags --libs raylib)
+
+# Or explicit include/link (works without pkg-config)
+cc -dynamiclib -o libmini3d.dylib engine.c \
+  -I"$RP/include" -L"$RP/lib" -lraylib \
+  -framework Cocoa -framework OpenGL -framework IOKit
 ```
 
-(If link fails, try `cc hello_cube.c -o hello_cube -lraylib` — brew provides pkgconfig; you can also `pkg-config --cflags --libs raylib`.)
+### Linux (pkg-config)
 
-### Windows (MSYS2 / Pacman)
-
-Use MSYS2; install mingw-w64 toolchain + raylib package:
-
-```
-pacman -S mingw-w64-x86_64-raylib mingw-w64-x86_64-toolchain
-gcc hello_cube.c -o hello_cube.exe -lraylib -lgdi32 -lwinmm -lole32 -luuid -lcomdlg32
-./hello_cube.exe
+```bash
+# ensure raylib is installed and visible to pkg-config
+cc -fPIC -shared -o libmini3d.so engine.c $(pkg-config --cflags --libs raylib)
 ```
 
-(If you use Visual Studio, use CMake and the raylib CMake config.)
+If `pkg-config` fails, set `PKG_CONFIG_PATH` to the directory containing `raylib.pc` or pass `-I`/`-L` manually.
+
+### Windows (MSYS2 / MinGW64)
+
+Open MinGW64 shell:
+
+```bash
+pacman -S mingw-w64-x86_64-raylib mingw-w64-x86_64-toolchain pkg-config
+gcc -shared -o mini3d.dll engine.c $(pkg-config --cflags --libs raylib) -Wl,--out-implib,libmini3d.a
+```
+
+### CMake alternative
+
+If you prefer CMake, a minimal `CMakeLists.txt` is recommended (use `find_package(raylib REQUIRED)` or `pkg-config`).
 
 ---
 
-## 3) Next steps (how to evolve this into a simple engine usable from other languages)
+## Generate / provide the sprite sheet (optional)
 
-- **Prototype in raylib C** until you like the update/render/physics loop.
-- If you want other languages to control it:
+If you want the sample atlas:
 
-  - Option A (easy): expose a **tiny C ABI** in your program (e.g., `engine_init`, `engine_step`, `engine_push_command`) and embed your script language in a separate process that sends commands via a simple socket or named pipe.
-  - Option B (tightest): build the engine as a shared library and create a Python binding (pybind11) or Node addon (napi). But that requires per-language build artifacts.
+```bash
+python3 make_terrain_sheet.py     # defaults -> terrain_sheet_simple.png + .json
+# or deterministic:
+python3 make_terrain_sheet.py --seed 42
+```
 
-- When you need higher performance IPC, move from text/JSON to binary (FlatBuffers / shared memory), but don't worry about that until your prototype needs it.
+Place `terrain_sheet_simple.png` next to `test_client.py` or pass an absolute path in the Python script.
 
 ---
 
-## TL;DR (one-line)
+## Run the demo (Python)
 
-**Use raylib C** if you want the fastest path to "walk around a cube" across platforms with minimal compilation pain. I gave you a full copy-paste C file plus compile commands — run it, tweak, and ask for the next iteration (e.g., textured cubes, mesh instancing, or making it a shared library to call from Python).
+1. Build the shared lib (see above). Put the produced `libmini3d.dylib` / `libmini3d.so` / `mini3d.dll` in the same directory as `test_client.py`, or load with an absolute path.
+2. Make sure the atlas PNG (`terrain_sheet_simple.png`) is present (or edit `test_client.py` to point to your asset).
+3. Run:
 
-Want me to produce:
+```bash
+python3 test_client.py
+```
 
-- a ready CMakeLists.txt for this file (so it builds on Windows/macOS/Linux consistently), **or**
-- a version that uses a texture atlas and `DrawCubeTexture` for faces?
+`test_client.py` will:
 
-Say which and I'll drop the exact file.
+- load the shared lib with `ctypes`
+- call `engine_create(...)`, `engine_load_atlas(...)`, define block tile mappings
+- create a small world and place some blocks
+- run a loop that calls `engine_tick(dt)` repeatedly until the window closes
+
+---
+
+## C API (short reference)
+
+These are the exported functions used by the Python client (types in C):
+
+```c
+Engine* engine_create(int width, int height, const char* title, int target_fps);
+void    engine_destroy(Engine* e);
+
+bool engine_load_atlas(Engine* e, const char* png_path, int tile_px, int cols, int rows);
+bool engine_define_block_tile(Engine* e, uint16_t block_id, int tile_index);
+
+bool engine_create_world(Engine* e, int sx, int sy, int sz);
+void engine_clear_world(Engine* e, uint16_t block_id);
+
+bool engine_set_block(Engine* e, int x, int y, int z, uint16_t block_id);
+uint16_t engine_get_block(Engine* e, int x, int y, int z);
+
+void engine_fill_box(Engine* e, int x0,int y0,int z0, int x1,int y1,int z1, uint16_t block_id);
+
+bool engine_tick(Engine* e, float dt); // returns false to request quit
+```
+
+See `engine.h` for exact typedefs and any extras (camera setters/getters, etc.). Keep FFI calls coarse: avoid calling per-block in tight loops — instead batch edits.
+
+---
+
+## Python usage example (ctypes snippet)
+
+```python
+import ctypes as C, os, sys, time
+
+libpath = os.path.abspath("./libmini3d.dylib")  # change extension per OS
+lib = C.CDLL(libpath)
+
+# prototypes (example)
+lib.engine_create.restype = C.c_void_p
+lib.engine_create.argtypes = [C.c_int, C.c_int, C.c_char_p, C.c_int]
+lib.engine_destroy.argtypes = [C.c_void_p]
+# ... declare other argtypes/restypes like in test_client.py
+
+e = lib.engine_create(1280, 720, b"Mini3D", 60)
+ok = lib.engine_load_atlas(e, b"terrain_sheet_simple.png", 64, 8, 8)
+# define tiles, create world, fill boxes...
+while lib.engine_tick(e, C.c_float(1.0/60.0)):
+    pass
+lib.engine_destroy(e)
+```
+
+---
+
+## Design & responsibilities (who does what)
+
+**C engine**
+
+- Performance-critical: rendering, camera update, input sampling, world storage, chunk meshing (future), picking/raycast.
+- Exposes a small, stable C API (opaque Engine pointer).
+- Keeps the hot loop internal and returns control to caller via `engine_tick()`.
+
+**Python client**
+
+- Game logic, rules, assets orchestration: worldgen, inventory, crafting, UI decisions, spawn logic.
+- Calls coarse C API methods; handles higher-level decisions and data structures.
+- Great for fast iteration and experimentation.
+
+---
+
+## Performance tips / guidance
+
+- Keep the ABI small and coarse: call C once per meaningful action (e.g., per chunk edit, per frame), not per block in hot code paths.
+- Implement chunking + mesh generation in C for anything larger than toy worlds. The example draws every cube and will not scale.
+- Use `ImageFromImage()` slicing once (as in the example) to create GPU textures, then draw or assign them to model materials — avoid CPU↔GPU uploads per frame.
+- Batch block edits with a single call if you need to terraform large areas.
+
+---
+
+## Packaging & distribution notes
+
+- License: **raylib** is zlib/libpng licensed — permissive. Your game code is your IP; no copyleft.
+- When shipping, include the raylib license with the raylib source in your repo if you redistribute the library source. Not required to show it to end users but good practice to include an acknowledgement file.
+- On macOS, if you build a `.dylib`, ensure correct install names or bundle it with the app package. On Linux, consider `LD_LIBRARY_PATH` or packaging the `.so` into the application directory.
+
+---
+
+## Troubleshooting (common issues)
+
+- **`raylib.h` not found**: either raylib isn’t installed or compiler can’t find headers. Use `brew --prefix raylib` on macOS and pass `-I"$RP/include"`, or set `PKG_CONFIG_PATH` and use `$(pkg-config --cflags --libs raylib)`.
+- **`Package raylib was not found`**: set `export PKG_CONFIG_PATH="$(brew --prefix raylib)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"`.
+- **Python can’t find PNG**: Python process `cwd` may differ. Use absolute path or `os.path.join(os.path.dirname(__file__), 'terrain_sheet_simple.png')`.
+- **Missing symbols (DrawCubeTexture / FILTER_BILINEAR)**: older/newer raylib variations may rename or not include convenience helpers. The example falls back to colored cubes for portability.
+- **High CPU / poor FPS**: naive per-cube drawing is expensive. Implement chunk meshing and face culling.
+
+---
+
+## Extending this example
+
+Ideas to make it a real prototype engine:
+
+- Implement chunking (e.g., 16×16×256), per-chunk greedy meshing in C.
+- Replace colored cubes with textured cube models (assign per-face UVs).
+- Expose event queue (pick events) for Python to consume.
+- Add networked multiplayer via a Python server that uses the same C ABI for clients.
+- Move inventory, crafting, entity AI to Python; keep collision & physics in C.
+
+---
+
+## License
+
+- The example C code here (your code) — pick your license (MIT recommended for examples).
+- raylib: zlib/libpng license (permissive). Include the license text if you redistribute raylib source.
+
+---
+
+## Final notes
+
+- This repo is intended to be a practical starting point: **fast to iterate** (Python), **fast to run** (C for render/physics).
+- Use the split to prototype gameplay in Python quickly, then move hot code to C/C++ when profiling demands it.
